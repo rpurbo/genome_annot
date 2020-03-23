@@ -1,0 +1,245 @@
+# ==================================================================
+# bacteria_plat.v02.snk
+# version: 23.10.19
+#
+# Snakemake workflow definition for polishing and annotating bacterial genome 
+# generated from Pacbio HGAP3 protocol.
+# 
+# To achieve portability and reproducibility, the tools used in the workflow
+# are installed in Singularity containers (SIMG_BASE).
+#
+# Steps:
+# 1. clean contig sequences headers
+# 2. polish with ILMN
+# 3. circularize contig sequences - berokka
+# 4. identify rRNA sequences - barrnap
+# 5. cluster rRNA sequences - uclust
+# 6. assign taxa - blastn vs. SILVA SSU database
+# 7. genome feature annotation - prokka
+# 8. genome completeness - busco
+# 9. average nucleotide identity - ANI.pl
+# ==================================================================
+
+
+from os.path import join
+
+APP_BASE=config["app_base"]
+SIMG_BASE=config["simg_base"]
+NAME=config["name"]
+SMRTDIR="smrt"
+threads_max=64
+
+
+rule all:
+	input: 
+		"99_summary/summary.txt"
+
+rule clean_header:
+	input:
+		asm_fasta = join(SMRTDIR,'polished_assembly.fasta'),
+		asm_fastq = join(SMRTDIR,'polished_assembly.fastq')
+	output:
+		clean_fasta = join("00_clean",'polished_assembly.headerclean.fasta'),
+		clean_fastq = join("00_clean",'polished_assembly.headerclean.fastq')
+	shell:
+		"sed -e \'s/|quiver//g\' {input.asm_fasta} > {output.clean_fasta} ;"
+		"sed -e \'s/|quiver//g\' {input.asm_fastq} > {output.clean_fastq} "
+
+rule ilmn_polish:
+	input:
+		clean_fasta = join("00_clean",'polished_assembly.headerclean.fasta')
+	output:
+		polished_fasta = join("00_polish",'polished_assembly.clean.fasta')
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif'),
+		pilon_simg = join(config["simg_base"], 'pilon.sif')
+	threads:
+		threads_max	
+	log:
+		"logs/00_polish.log"
+	shell:
+		"mkdir -p 00_polish ;"
+		"singularity exec {params.pilon_simg} bowtie2-build {input.clean_fasta} 00_polish/index 2> {log};"
+		"singularity exec {params.pilon_simg} bowtie2 -p {threads} --very-sensitive -x 00_polish/index -1 ilmn.R1.fastq -2 ilmn.R2.fastq -S 00_polish/mapping.sam 2> {log};"
+		"singularity exec {params.pilon_simg} samtools view -@ {threads} -bS -q 20 -f 2 00_polish/mapping.sam > 00_polish/mapping.bam 2> {log}; "
+		"singularity exec {params.pilon_simg} samtools sort -@ {threads} -o 00_polish/mapping.sorted.bam 00_polish/mapping.bam 2> {log}; "
+		"singularity exec {params.pilon_simg} samtools index 00_polish/mapping.sorted.bam  2> {log};"
+		"singularity exec {params.pilon_simg} run_pilon.sh --genome {input.clean_fasta} --frags 00_polish/mapping.sorted.bam --outdir 00_polish --output pilon --tracks --changes --vcf --fix all --mindepth 0.1 --mingap 10 --minmq 30 --minqual 20 --K 47 --threads {threads};"
+		"cp 00_polish/pilon.fasta {output.polished_fasta}"
+
+
+rule circularize:
+	input:
+		clean_fasta = join("00_polish",'polished_assembly.clean.fasta')
+	output:
+		fasta = "01_circularize/polished_assembly.clean.circular.fasta",
+		dir = directory("01_circularize/contigs")
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/01_circularize.log"
+	shell:
+		"singularity exec {params.asm_simg} berokka --force --outdir 01_circularize {input.clean_fasta} 2> {log};"
+		"cp 01_circularize/02.trimmed.fa {output.fasta};"
+		"mkdir -p 01_circularize/contigs;"
+		"singularity exec {params.asm_simg} WF_split_contigs.pl;"
+		"cp {output.fasta} ." 
+
+rule ident_rrna:
+	input:
+		"01_circularize/polished_assembly.clean.circular.fasta"
+	output:
+		gff = "02_rrna/rrna.gff",
+		all_fasta = "02_rrna/rrna.fasta",
+		fasta = "02_rrna/16S_rrna.fasta"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/02_rrna.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} barrnap --threads {threads} --kingdom bac --outseq {output.all_fasta} {input} > {output.gff} 2> {log};"
+		"cat {output.all_fasta} | grep -A 1 16S_rRNA > {output.fasta}"
+
+rule cluster_rrna:
+	input: 
+		"02_rrna/16S_rrna.fasta"
+	output:
+		rep = "02_rrna/16S_rrna.rep.fasta"
+	log:
+		"logs/02_rrna_uclust.log"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	shell:
+		"singularity exec {params.asm_simg} uclust --sort {input} --output 02_rrna/16S_rrna.sorted.fasta 2> {log};"
+		"singularity exec {params.asm_simg} uclust --input 02_rrna/16S_rrna.sorted.fasta --uc 02_rrna/16S_rrna.sorted.uc --id 0.97 --rev 2>> {log};"
+		"singularity exec {params.asm_simg} uclust --types S --uc2fasta 02_rrna/16S_rrna.sorted.uc --input 02_rrna/16S_rrna.sorted.fasta --output {output.rep} 2>> {log}"
+		
+rule assign_taxa:
+	input:
+		"02_rrna/16S_rrna.rep.fasta"
+	output:
+		hits="03_taxa_class/16S_rrna.rep.SILVA.txt",
+		taxon="03_taxa_class/16S_rrna.rep.taxa.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/03_taxa_class.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} blastn -num_threads {threads} -outfmt \"7 qaccver saccver pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore\" -query {input} -db /apps/db/SILVA/SILVA_132_SSURef_Nr99 -out {output.hits} 2> {log};"
+		"singularity exec {params.asm_simg} extract_top_blastn_hits.pl {output.hits} >  {output.taxon} ;"
+		"cp {output.taxon} ."
+
+rule annotation:
+	input:
+		"01_circularize/polished_assembly.clean.circular.fasta"
+	output:
+		"04_features/annot.gbk",
+		"04_features/annot.tsv",
+		"04_features/annot.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/04_features.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} prokka --force --prefix annot --outdir 04_features --cpus {threads} --rfam {input} ;"
+		"cp 04_features/annot.log {log}"
+
+rule busco:
+	input:
+		"01_circularize/polished_assembly.clean.circular.fasta"
+	output:
+		sum = "05_busco/short_summary_busco.txt"
+	params:
+		busco_simg = join(config["simg_base"], 'busco.sif')
+	log:
+		"logs/05_busco.log"
+	threads:
+		threads_max
+	shell:
+		"cp -r /gpfs1/apps/busco/augustus_config . ;"
+		"env SINGULARITYENV_AUGUSTUS_CONFIG_PATH=$PWD/augustus_config singularity exec {params.busco_simg} run_BUSCO.py -i {input} -c {threads} -o busco -m genome -l /apps/busco/lineage/bacteria_odb9 -f;"
+		"mkdir -p 05_busco;"
+		"mv run_busco/* 05_busco/;"
+		"rmdir run_busco"
+
+rule ani:
+	input:
+		"01_circularize/polished_assembly.clean.circular.fasta"
+	output:
+		"06_ANI/FinalScoresANI.out"
+	params:
+		ani_app = join(config["app_base"], 'ani','ani_wrapper.sh'),
+		db_list = "/gpfs1/db/ANI/type_proxytype_genomes/191018/genomelist.txt",
+		mapfile = "/gpfs1/db/ANI/type_proxytype_genomes/191018/ORG_MAP.pm"
+	log:
+		"logs/06_ani.log"
+	threads:
+		threads_max
+	shell:
+		"mkdir -p 06_ANI/temp;"
+		"cd 06_ANI;"
+		"{params.ani_app} -t {threads} -i ../{input} -l {params.db_list} -m {params.mapfile} -o temp;"
+		"rm -rf temp;"
+		"cd .."
+
+	
+rule summarize:
+	input:
+		asm = "01_circularize/polished_assembly.clean.circular.fasta",
+		rep16s = "02_rrna/16S_rrna.rep.fasta",
+		silva = "03_taxa_class/16S_rrna.rep.SILVA.txt",
+		rep = "03_taxa_class/16S_rrna.rep.taxa.txt",
+		annot = "04_features/annot.txt",
+		annottsv = "04_features/annot.tsv",
+		busco = "05_busco/short_summary_busco.txt",
+		ani = "06_ANI/FinalScoresANI.out"
+	output:
+		"99_summary/summary.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	shell:
+		"singularity exec {params.asm_simg} WF_sum_instrument.pl > 99_summary/instrument.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_subreads.pl > 99_summary/subreads.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_assembly.pl > 99_summary/assembly.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_coverage.pl > 99_summary/coverage.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_assembly_postQC.v2.pl > 99_summary/assembly_postQC.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_taxa.pl > 99_summary/taxa.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_annot.pl > 99_summary/annot.summary.txt;"
+		"cat 99_summary/instrument.summary.txt > {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/subreads.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/assembly.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/coverage.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/assembly_postQC.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"echo '\n[Pilon Polishing Summary\n' >> {output};"
+		"echo 'Num of polished bases: ' >> {output} ;"
+		"wc -l pilon.changes >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/taxa.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/annot.summary.txt >> {output};"
+		"echo '\n[BUSCO Summary]\n' >> {output};"
+		"cat {input.busco}  >> {output};"
+		"echo '\n[ANI Summary (Top 5)]\n' >> {output};"
+		"head -n 6 {input.ani} >> {output};"
+		"cp {output} . ;"
+		"singularity exec {params.asm_simg} cat /apps/MANIFEST > MANIFEST"
+
+
+
+
+
+
+
+
+

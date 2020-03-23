@@ -1,0 +1,19 @@
+#!/bin/bash
+#PBS -N {$asm_name}
+#PBS -q {$queue_name}
+#PBS -j oe
+#PBS -l select=1:ncpus={$threads}
+#PBS -o {$log_name}
+
+cd {$workdir}
+
+hostname
+date
+pwd
+
+module load python3/3.7.3
+module load singularity/3.3
+unset PYTHONHOME
+
+snakemake --nolock --snakefile {$workflow} --cores {$threads} --config name={$asm_name} simg_base={$simg} app_base={$apps}
+

@@ -1,0 +1,280 @@
+# ==================================================================
+# fungi_nonpbio.v01.snk
+# version: 21.10.19
+#
+# Snakemake workflow definition for annotating fungal genome generated
+# from non-specific genome assembly protocol.
+#
+# To achieve portability and reproducibility, the tools used in the workflow
+# are installed in Singularity containers (SIMG_BASE).
+#
+# Steps:
+# 1. clean contig sequences headers
+# 2. circularize contig sequences - berokka
+# 3. identify rRNA/ITS sequences - barrnap / ITSx
+# 4. cluster rRNA/ITS sequences - uclust
+# 5. assign taxa - blastn vs. SILVA/UNITE database
+# 6. genome feature annotation - funannotate
+# 7. genome completeness - busco
+# 8. average nucleotide identity - ANI.pl
+# ==================================================================
+
+from os.path import join
+
+APP_BASE=config["app_base"]
+SIMG_BASE=config["simg_base"]
+NAME=config["name"]
+threads_max = 64
+
+rule all:
+	input: 
+		"99_summary/summary.txt"
+
+rule clean_header:
+	input:
+		asm_fasta = "contigs.fasta"
+	output:
+		clean_fasta = join("00_clean",'contigs.clean.fasta')
+	shell:
+		"sed -e \'s/|quiver//g\' {input.asm_fasta} > {output.clean_fasta} "
+
+rule circularize:
+	input:
+		clean_fasta = join("00_clean",'contigs.clean.fasta')
+	output:
+		fasta = "01_circularize/contigs.clean.circular.fasta",
+		dir = directory("01_circularize/contigs")
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/01_circularize.log"
+	shell:
+		"singularity exec {params.asm_simg} berokka --force --outdir 01_circularize {input.clean_fasta} 2> {log};"
+		"cp 01_circularize/02.trimmed.fa {output.fasta};"
+		"mkdir -p 01_circularize/contigs;"
+		"singularity exec {params.asm_simg} WF_split_contigs_npbio.pl;"
+		"cp {output.fasta} ." 
+
+rule ident_rrna:
+	input:
+		"01_circularize/contigs.clean.circular.fasta"
+	output:
+		gff = "02_rrna/rrna.gff",
+		all_fasta = "02_rrna/rrna.fasta",
+		fasta = "02_rrna/18S_rrna.fasta"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/02_rrna.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} barrnap --threads {threads} --kingdom euk --outseq {output.all_fasta} {input} > {output.gff} 2> {log};"
+		"cat {output.all_fasta} | grep -A 1 18S_rRNA > {output.fasta}"
+
+rule ident_its:
+	input:
+		"01_circularize/contigs.clean.circular.fasta"
+	output:
+		"02_its/its.full.fasta"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	threads:
+		threads_max
+	log:
+		"logs/02_its.log"
+	shell:
+		"mkdir -p 02_its;"
+		"singularity exec {params.asm_simg} ITSx -t fungi -i {input} -o 02_its/its --cpu {threads} --graphical T --save_regions all --only_full T 2> {log}"
+
+
+rule cluster_18S_rrna:
+	input: 
+		"02_rrna/18S_rrna.fasta"
+	output:
+		rep = "02_rrna/18S_rrna.rep.fasta"
+	log:
+		"logs/02_rrna_uclust.log"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	shell:
+		"singularity exec {params.asm_simg} uclust --sort {input} --output 02_rrna/18S_rrna.sorted.fasta 2> {log};"
+		"singularity exec {params.asm_simg} uclust --input 02_rrna/18S_rrna.sorted.fasta --uc 02_rrna/18S_rrna.sorted.uc --id 0.97 --rev 2>> {log};"
+		"singularity exec {params.asm_simg} uclust --types S --uc2fasta 02_rrna/18S_rrna.sorted.uc --input 02_rrna/18S_rrna.sorted.fasta --output {output.rep} 2>> {log}"
+
+rule cluster_its:
+	input:
+		"02_its/its.full.fasta"
+	output:
+		"02_its/its.rep.fasta"
+	log:
+		"logs/02_its_uclust.log"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')	
+	shell:
+		"singularity exec {params.asm_simg} uclust --sort {input} --output 02_its/its.sorted.fasta 2> {log};"
+		"singularity exec {params.asm_simg} uclust --input 02_its/its.sorted.fasta --uc 02_its/its.sorted.uc --id 0.97 --rev 2>> {log};"
+		"singularity exec {params.asm_simg} uclust --types S --uc2fasta 02_its/its.sorted.uc --input 02_its/its.sorted.fasta --output {output} 2>> {log}"
+
+		
+rule assign_taxa:
+	input:
+		"02_rrna/18S_rrna.rep.fasta"
+	output:
+		hits="03_taxa_class/18S_rrna.rep.SILVA.txt",
+		taxon="03_taxa_class/18S_rrna.rep.taxa.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/03_taxa_class.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} blastn -num_threads {threads} -outfmt \"7 qaccver saccver pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore\" -query {input} -db /apps/db/SILVA/SILVA_132_SSURef_Nr99 -out {output.hits} 2> {log};"
+		"singularity exec {params.asm_simg} extract_top_blastn_hits.pl {output.hits} >  {output.taxon} ;"
+		"cp {output.taxon} ."
+
+
+rule assign_taxa_its:
+	input:
+		"02_its/its.rep.fasta"
+	output:
+		hits="03_taxa_class/its.rep.UNITE.txt",
+		taxon="03_taxa_class/its.rep.taxa.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif'),
+		db = "/apps/db/UNITE/UNITE_public_02.02.2019"
+	log:
+		"logs/03_its_class.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} blastn -num_threads {threads} -outfmt \"7 qaccver saccver pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore\" -query {input} -db {params.db} -out {output.hits} 2> {log};"
+		"singularity exec {params.asm_simg} extract_top_blastn_hits.pl {output.hits} >  {output.taxon} ;"
+		"cp {output.taxon} ."
+
+
+
+rule mask_assembly:
+	input:
+		"01_circularize/contigs.clean.circular.fasta"
+	output:
+		"contigs.clean.circular.masked.fasta"
+	params:
+		asm_simg = join(config["simg_base"], 'funannotate.sif')
+	log:
+		"logs/04_features.mask.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} funannotate mask -i {input} -o {output} --cpus {threads} 2> {log}"
+
+rule predict:
+	input:
+		"contigs.clean.circular.masked.fasta"
+	output:
+		directory("04_predict")
+	params:
+		asm_simg = join(config["simg_base"], 'funannotate.sif')
+	log:
+		"logs/04_features.predict.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} funannotate predict -i {input} -s \"Genus Species\" -o {output} --busco_seed_species saccharomyces --cpus {threads} 2> {log}"
+
+rule annotation:
+	input:
+		"04_predict"
+	output:
+		directory("04_features")
+	params:
+		asm_simg = join(config["simg_base"], 'funannotate.sif')
+	log:
+		"logs/04_features.annotate.log"
+	threads:
+		threads_max
+	shell:
+		"singularity exec {params.asm_simg} funannotate annotate --force -i {input} --cpus {threads} 2> {log} ;"
+		"mkdir -p {output};"
+		"mv {input}/annotate* {output}/"
+
+rule busco:
+	input:
+		"01_circularize/contigs.clean.circular.fasta"
+	output:
+		sum = "05_busco/short_summary_busco.txt"
+	params:
+		busco_simg = join(config["simg_base"], 'busco.sif')
+	log:
+		"logs/05_busco.log"
+	threads:
+		threads_max
+	shell:
+		"cp -r /gpfs1/apps/busco/augustus_config . ;"
+		"env SINGULARITYENV_AUGUSTUS_CONFIG_PATH=$PWD/augustus_config singularity exec {params.busco_simg} run_BUSCO.py -i {input} -c {threads} -o busco -m genome -l /apps/busco/lineage/fungi_odb9 -f;"
+		"mkdir -p 05_busco;"
+		"mv run_busco/* 05_busco/;"
+		"rmdir run_busco"
+
+rule ani:
+	input:
+		"01_circularize/contigs.clean.circular.fasta"
+	output:
+		"06_ANI/FinalScoresANI.out"
+	params:
+		ani_app = join(config["app_base"], 'ani','ani_wrapper.sh'),
+		db_list = "/gpfs1/db/ANI/type_proxytype_genomes/191018/genomelist.txt",
+		mapfile = "/gpfs1/db/ANI/type_proxytype_genomes/191018/ORG_MAP.pm"
+	log:
+		"logs/06_ani.log"
+	threads:
+		threads_max
+	shell:
+		"mkdir -p 06_ANI/temp;"
+		"cd 06_ANI;"
+		"{params.ani_app} -t {threads} -i ../{input} -l {params.db_list} -m {params.mapfile} -o temp;"
+		"rm -rf temp;"
+		"cd .."
+
+
+
+rule summarize:
+	input:
+		contigs = "01_circularize/contigs.clean.circular.fasta",
+		rrna_taxa = "03_taxa_class/18S_rrna.rep.taxa.txt",
+		its_taxa = "03_taxa_class/its.rep.taxa.txt",
+		feat = "04_features",
+		busco = "05_busco/short_summary_busco.txt",
+		ani = "06_ANI/FinalScoresANI.out"			
+	output:
+		"99_summary/summary.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	shell:
+		"singularity exec {params.asm_simg} WF_sum_assembly_N50.pl {input.contigs} > 99_summary/assembly.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_taxa_fungi_18S.pl > 99_summary/taxa.18S.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_taxa_fungi_ITS.pl > 99_summary/taxa.ITS.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_annot_fungi.pl > 99_summary/annot.summary.txt;"
+		"cat 99_summary/assembly.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/taxa.18S.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/taxa.ITS.summary.txt >> {output};" 
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/annot.summary.txt >> {output};"
+		"echo '\n[BUSCO Summary]\n' >> {output};"
+		"cat {input.busco}  >> {output};"
+		"echo '\n[ANI Summary]\n' >> {output};"
+		"head -n 6 {input.ani} >> {output};"
+		"cp {output} . ;"
+		"singularity exec {params.asm_simg} cat /apps/MANIFEST > MANIFEST"
+
+
+
+
+
+
+
+
+

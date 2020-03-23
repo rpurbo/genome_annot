@@ -1,0 +1,2 @@
+ABX_ARISO253-PB_HGAP3	bacteria
+ABX_ARISO430-PB_HGAP3	bacteria

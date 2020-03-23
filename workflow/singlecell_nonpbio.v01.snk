@@ -1,0 +1,296 @@
+# ==================================================================
+# singlecell_nonpbio.v01.snk
+# version: 31.10.19
+#
+# Snakemake workflow definition for annotating single-cell genome generated 
+# from non-specific genome assembly protocol.
+# 
+# To achieve portability and reproducibility, the tools used in the workflow
+# are installed in Singularity containers (SIMG_BASE).
+#
+# Steps:
+# 1. identify rRNA sequences - barrnap - 16S/18S/ITS
+# 2. cluster rRNA sequences - uclust - 16S/18S/ITS
+# 3. assign taxa - blastn vs. SILVA SSU & UNITE
+# 4. genome completeness - busco - bac & fun
+# ==================================================================
+
+
+from os.path import join
+
+APP_BASE=config["app_base"]
+SIMG_BASE=config["simg_base"]
+NAME=config["name"]
+SMRTDIR="smrt"
+threads_max=64
+
+rule all:
+	input: 
+		"99_summary/summary.txt"
+
+rule clean_header:
+	input:
+		asm_fasta = "contigs.fasta"
+	output:
+		clean_fasta = join("00_clean",'contigs.clean.fasta'),
+	shell:
+		"sed -e \'s/|quiver//g\' {input.asm_fasta} > {output.clean_fasta} "
+
+rule ident_16Srrna:
+	input:
+		"00_clean/contigs.clean.fasta"
+	output:
+		gff = "02_rrna/16Srrna.gff",
+		all_fasta = "02_rrna/16Srrna.fasta",
+		fasta = "02_rrna/16S_rrna.fasta"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/02_rrna.log"
+	threads:
+		threads_max
+	shell:
+		"touch {output.gff} ; touch {output.all_fasta} ; touch {output.fasta};"
+		"singularity exec {params.asm_simg} barrnap --threads {threads} --kingdom bac --outseq {output.all_fasta} {input} > {output.gff} 2> {log} || true;"
+		"cat {output.all_fasta} | grep -A 1 16S_rRNA > {output.fasta} || true"
+
+
+rule cluster_16Srrna:
+	input: 
+		fasta = "02_rrna/16S_rrna.fasta"
+	output:
+		rep = "02_rrna/16S_rrna.rep.fasta"
+	log:
+		"logs/02_rrna_uclust.log"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	run:
+		if os.stat(input.fasta).st_size > 0:
+			shell("singularity exec {params.asm_simg} uclust --sort {input} --output 02_rrna/16S_rrna.sorted.fasta 2> {log} || true")
+			shell("singularity exec {params.asm_simg} uclust --input 02_rrna/16S_rrna.sorted.fasta --uc 02_rrna/16S_rrna.sorted.uc --id 0.97 --rev 2>> {log} || true")
+			shell("singularity exec {params.asm_simg} uclust --types S --uc2fasta 02_rrna/16S_rrna.sorted.uc --input 02_rrna/16S_rrna.sorted.fasta --output {output.rep} 2>> {log} || true")
+			shell("wc -l {output.rep} | cut -d \" \" -f 1 | awk \'$0/2 > 1 {{print \"[WARNING] Multiple 16S gene sequences are identified.\"}}\' >> WARNING.log ")
+		else:
+			shell("echo '[WARNING] No 16S gene sequences are detected.' >> WARNING.log")
+ 			shell("touch {output}")
+
+		
+rule assign_16Staxa:
+	input:
+		fasta = "02_rrna/16S_rrna.rep.fasta"
+	output:
+		hits="03_taxa_class/16S_rrna.rep.SILVA.txt",
+		taxon="03_taxa_class/16S_rrna.rep.taxa.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	log:
+		"logs/03_taxa_class.log"
+	threads:
+		threads_max
+	run:
+		if os.stat(input.fasta).st_size > 0:
+			shell("singularity exec {params.asm_simg} blastn -num_threads {threads} -outfmt \"7 qaccver saccver pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore\" -query {input} -db /apps/db/SILVA/SILVA_132_SSURef_Nr99 -out {output.hits} 2> {log}")
+			shell("singularity exec {params.asm_simg} extract_top_blastn_hits.pl {output.hits} >  {output.taxon}")
+			shell("cp {output.taxon} .")
+		else:
+			shell("touch {output.hits}")
+			shell("touch {output.taxon}")
+
+
+
+rule ident_18Srrna:
+        input:
+                "00_clean/contigs.clean.fasta"
+        output:
+                gff = "02_rrna/18Srrna.gff",
+                all_fasta = "02_rrna/18Srrna.fasta",
+                fasta = "02_rrna/18S_rrna.fasta"
+        params:
+                asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+        log:
+                "logs/02_rrna.log"
+        threads:
+                threads_max
+        shell:
+                "touch {output.gff} ; touch {output.all_fasta} ; touch {output.fasta};"
+                "singularity exec {params.asm_simg} barrnap --threads {threads} --kingdom euk --outseq {output.all_fasta} {input} > {output.gff} 2> {log} || true;"
+                "cat {output.all_fasta} | grep -A 1 18S_rRNA > {output.fasta} || true"
+
+
+rule cluster_18S_rrna:
+        input:
+                fasta = "02_rrna/18S_rrna.fasta"
+        output:
+                rep = "02_rrna/18S_rrna.rep.fasta"
+        log:
+                "logs/02_rrna_uclust.log"
+        params:
+                asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+        run:
+                if os.stat(input.fasta).st_size > 0:
+                        shell("singularity exec {params.asm_simg} uclust --sort {input} --output 02_rrna/18S_rrna.sorted.fasta 2> {log} || true")
+                        shell("singularity exec {params.asm_simg} uclust --input 02_rrna/18S_rrna.sorted.fasta --uc 02_rrna/18S_rrna.sorted.uc --id 0.97 --rev 2>> {log} || true")
+                        shell("singularity exec {params.asm_simg} uclust --types S --uc2fasta 02_rrna/18S_rrna.sorted.uc --input 02_rrna/18S_rrna.sorted.fasta --output {output.rep} 2>> {log} || true")
+                        shell("wc -l {output.rep} | cut -d \" \" -f 1 | awk \'$0/2 > 1 {{print \"[WARNING] Multiple 18S gene sequences are identified.\"}}\' >> WARNING.log ")
+                else:
+                        shell("echo '[WARNING] No 18S gene sequences are detected.' >> WARNING.log")
+                        shell("touch {output}")
+
+
+rule assign_18Staxa:
+        input:
+                fasta = "02_rrna/18S_rrna.rep.fasta"
+        output:
+                hits="03_taxa_class/18S_rrna.rep.SILVA.txt",
+                taxon="03_taxa_class/18S_rrna.rep.taxa.txt"
+        params:
+                asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+        log:
+                "logs/03_taxa_class.log"
+        threads:
+                threads_max
+        run:
+                if os.stat(input.fasta).st_size > 0:
+                        shell("singularity exec {params.asm_simg} blastn -num_threads {threads} -outfmt \"7 qaccver saccver pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore\" -query {input} -db /apps/db/SILVA/SILVA_132_SSURef_Nr99 -out {output.hits} 2> {log} || true")
+                        shell("singularity exec {params.asm_simg} extract_top_blastn_hits.pl {output.hits} >  {output.taxon} || true")
+                        shell("cp {output.taxon} .")
+                else:
+                        shell("touch {output.hits}")
+                        shell("touch {output.taxon}")
+
+rule ident_its:
+        input:
+                "00_clean/contigs.clean.fasta"
+        output:
+                "02_its/its.full.fasta"
+        params:
+                asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+        threads:
+                threads_max
+        log:
+                "logs/02_its.log"
+        shell:
+                "mkdir -p 02_its;"
+                "touch {output};"
+                "singularity exec {params.asm_simg} ITSx -t fungi -i {input} -o 02_its/its --cpu {threads} --graphical T --save_regions all --only_full T 2> {log} || true"
+
+
+rule cluster_its:
+        input:
+                fasta = "02_its/its.full.fasta"
+        output:
+                rep = "02_its/its.rep.fasta"
+        log:
+                "logs/02_its_uclust.log"
+        params:
+                asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+        run:
+                if os.stat(input.fasta).st_size > 0:
+                        shell("singularity exec {params.asm_simg} uclust --sort {input} --output 02_its/its.sorted.fasta 2> {log} || true")
+                        shell("singularity exec {params.asm_simg} uclust --input 02_its/its.sorted.fasta --uc 02_its/its.sorted.uc --id 0.97 --rev 2>> {log} || true")
+                        shell("singularity exec {params.asm_simg} uclust --types S --uc2fasta 02_its/its.sorted.uc --input 02_its/its.sorted.fasta --output {output} 2>> {log} || true")
+                        shell("wc -l {output.rep} | cut -d \" \" -f 1 | awk \'$0/2 > 1 {{print \"[WARNING] Multiple ITS gene sequences are identified.\"}}\' >> WARNING.log ")
+                else:
+                        shell("echo '[WARNING] No full ITS gene sequences are detected.' >> WARNING.log")
+                        shell("touch {output}")
+
+
+rule assign_taxa_its:
+        input:
+                fasta = "02_its/its.rep.fasta"
+        output:
+                hits="03_taxa_class/its.rep.UNITE.txt",
+                taxon="03_taxa_class/its.rep.taxa.txt"
+        params:
+                asm_simg = join(config["simg_base"], 'asm_annot_tools.sif'),
+                db = "/apps/db/UNITE/UNITE_public_02.02.2019"
+        log:
+                "logs/03_its_class.log"
+        threads:
+                threads_max
+        run:
+                if os.stat(input.fasta).st_size > 0:
+                        shell("singularity exec {params.asm_simg} blastn -num_threads {threads} -outfmt \"7 qaccver saccver pident qlen slen length mismatch gapopen qstart qend sstart send evalue bitscore\" -query {input} -db {params.db} -out {output.hits} 2> {log} || true")
+                        shell("singularity exec {params.asm_simg} extract_top_blastn_hits.pl {output.hits} >  {output.taxon} || true")
+                        shell("cp {output.taxon} .")
+                else:
+                        shell("touch {output.hits}")
+                        shell("touch {output.taxon}")
+
+
+
+
+rule busco_bac:
+	input:
+		"00_clean/contigs.clean.fasta"
+	output:
+		sum = "05_busco/short_summary_busco.txt"
+	params:
+		busco_simg = join(config["simg_base"], 'busco.sif')
+	log:
+		"logs/05_busco.log"
+	threads:
+		threads_max
+	shell:
+		"cp -r /gpfs1/apps/busco/augustus_config . ;"
+		"env SINGULARITYENV_AUGUSTUS_CONFIG_PATH=$PWD/augustus_config singularity exec {params.busco_simg} run_BUSCO.py -i {input} -c {threads} -o busco -m genome -l /apps/busco/lineage/bacteria_odb9 -f;"
+		"mkdir -p 05_busco;"
+		"mv run_busco/* 05_busco/;"
+		"rmdir run_busco"
+
+
+rule busco_fun:
+        input:
+                "00_clean/contigs.clean.fasta"
+        output:
+                sum = "05_busco_fun/short_summary_busco_fun.txt"
+        params:
+                busco_simg = join(config["simg_base"], 'busco.sif')
+        log:
+                "logs/05_busco.log"
+        threads:
+                threads_max
+        shell:
+                "cp -r /gpfs1/apps/busco/augustus_config . ;"
+                "env SINGULARITYENV_AUGUSTUS_CONFIG_PATH=$PWD/augustus_config singularity exec {params.busco_simg} run_BUSCO.py -i {input} -c {threads} -o busco_fun -m genome -l /apps/busco/lineage/fungi_odb9 -f;"
+                "mkdir -p 05_busco_fun;"
+                "mv run_busco_fun/* 05_busco_fun/;"
+                "rmdir run_busco_fun"
+
+
+	
+rule summarize:
+	input:
+		contigs = join("00_clean","contigs.clean.fasta"),
+		silva = "03_taxa_class/16S_rrna.rep.SILVA.txt",
+		rep16staxa = "03_taxa_class/16S_rrna.rep.taxa.txt",
+		rep18staxa = "03_taxa_class/18S_rrna.rep.taxa.txt",
+		repITStaxa = "03_taxa_class/its.rep.taxa.txt",
+		busco = "05_busco/short_summary_busco.txt",
+		busco_fun = "05_busco_fun/short_summary_busco_fun.txt"
+	output:
+		"99_summary/summary.txt"
+	params:
+		asm_simg = join(config["simg_base"], 'asm_annot_tools.sif')
+	shell:
+		"singularity exec {params.asm_simg} WF_sum_assembly_N50.pl {input.contigs} > 99_summary/assembly.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_taxa.pl > 99_summary/taxa.summary.txt;"
+		"singularity exec {params.asm_simg} WF_sum_taxa_fungi_18S.pl > 99_summary/taxa.18S.summary.txt;"
+                "singularity exec {params.asm_simg} WF_sum_taxa_fungi_ITS.pl > 99_summary/taxa.ITS.summary.txt;"
+		"cat 99_summary/assembly.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+		"cat 99_summary/taxa.summary.txt >> {output};"
+		"echo '\n\n' >> {output};"
+                "cat 99_summary/taxa.18S.summary.txt >> {output};"
+                "echo '\n\n' >> {output};"
+                "cat 99_summary/taxa.ITS.summary.txt >> {output};"
+                "echo '\n\n' >> {output};"
+		"echo '\n[BUSCO Summary - BAC]\n' >> {output};"
+		"cat {input.busco}  >> {output};"
+                "echo '\n[BUSCO Summary - FUN]\n' >> {output};"
+                "cat {input.busco_fun}  >> {output};"
+		"echo '\n[WARNINGS]\n' >> {output};"
+		"cat WARNING.log  >> {output};"
+		"cp {output} . ;"
+		"singularity exec {params.asm_simg} cat /apps/MANIFEST > MANIFEST"
+

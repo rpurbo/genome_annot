@@ -1,0 +1,25 @@
+#CHANGES
+#TODO:
+- accept assembly contigs for annotation
+	- bacteria: change the assembly summary to N50 (scripts/image_scripts/WF_sum_assembly_N50.pl -> bake to image (done)
+	- do for fungi (done)
+- handle illumina for polishing (separate pipeline)
+
+# ADD NEW FEATURES:
+- ANI (bac)
+- parameters and command lines in a manifest file
+- BUSCO (bac)
+
+
+
+
+# ANI
+# Here is the information for running the ANI which you mentioned you could add to your isolate pipeline. Prem sent me about how the latest batch of bacteria isolates were run with ANI. The code Prem passed to me:
+#
+# /gpfs0/scratch/cheinle/prems_ani/CalculateANIScores.sh 
+#
+# and
+#
+# /gpfs0/scratch/cheinle/prems_ani/SortRankANIresults.pl
+#
+# Both scripts reference scripts and data actually in Prem's folders. Please reply if you need permissions.
